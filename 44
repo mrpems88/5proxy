@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HTML Button & CSS Inspector — v3.7
+- Non-blocking Selenium init + page load timeout
+- Step timeouts, picker, type text, RANDOM_EMAIL
+- Human-in-the-loop captcha pause
+- Persist state, Chrome proxy
+"""
+import os, sys, json, re, random, string, threading, time, shutil
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional
+
+from PyQt5 import QtWidgets, QtCore
+
+_HAS_WEB = True
+try:
+    from PyQt5 import QtWebEngineWidgets
+except Exception:
+    _HAS_WEB = False
+
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+
+# Selenium helper
+def _import_selenium():
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.common.exceptions import TimeoutException
+    from webdriver_manager.chrome import ChromeDriverManager
+    return webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager
+
+APP_DIR = os.path.abspath(os.getcwd())
+PROFILE_DIR = os.path.join(APP_DIR, ".chrome_profile")
+CACHE_DIR = os.path.join(PROFILE_DIR, "Cache")
+STATE_PATH = os.path.join(APP_DIR, ".app_state.json")
+def _clear_dir_safe(path: str):
+    if not os.path.exists(path):
+        return
+    # Try rmtree with retries (Windows can lock files)
+    for _ in range(5):
+        try:
+            shutil.rmtree(path)
+            break
+        except Exception:
+            time.sleep(0.3)
+    if os.path.exists(path):
+        # Fallback: remove contents
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                try: os.remove(os.path.join(root, name))
+                except Exception: pass
+            for name in dirs:
+                try: os.rmdir(os.path.join(root, name))
+                except Exception: pass
+        try: os.rmdir(path)
+        except Exception: pass
+
+os.makedirs(PROFILE_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# --------------- Utils ---------------
+def read_text_safely(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f: return f.read()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="latin-1", errors="ignore") as f: return f.read()
+    except Exception: return ""
+
+def is_remote_href(href: str) -> bool:
+    try:
+        scheme = urlparse(href).scheme.lower()
+        return scheme in ("http", "https")
+    except Exception:
+        return False
+
+def element_text(el) -> str:
+    txt = el.get_text(strip=True) if hasattr(el, "get_text") else ""
+    return txt[:200]
+
+def build_css_selector(el) -> str:
+    tag = el.name if hasattr(el, "name") else "element"
+    el_id = el.attrs.get("id", "")
+    if el_id: return f"#{el_id}"
+    classes = el.attrs.get("class", [])
+    if classes: return f"{tag}." + ".".join(classes)
+    typ = el.attrs.get("type", "")
+    if tag == "input" and typ: return f'input[type="{typ}"]'
+    return tag
+
+def build_xpath_like(el) -> str:
+    parts=[]; node=el
+    while node and getattr(node, "name", None) not in (None, "[document]"):
+        tag=node.name; idx=1
+        if node.parent:
+            same=[c for c in node.parent.find_all(tag, recursive=False)]
+            for i,s in enumerate(same,1):
+                if s is node: idx=i; break
+        parts.append(f"{tag}[{idx}]"); node=node.parent
+    return "/" + "/".join(reversed(parts))
+
+def collect_buttons(soup) -> List[Dict[str, Any]]:
+    out=[]
+    def add_el(el):
+        out.append({
+            "tag": el.name, "text": element_text(el), "id": el.attrs.get("id",""),
+            "classes": " ".join(el.attrs.get("class", [])), "type": el.attrs.get("type",""),
+            "name": el.attrs.get("name",""), "role": el.attrs.get("role",""),
+            "onclick": el.attrs.get("onclick",""),
+            "selector": build_css_selector(el), "xpath_like": build_xpath_like(el),
+        })
+    for el in soup.find_all("button"): add_el(el)
+    for el in soup.find_all("input"):
+        t=(el.attrs.get("type") or "").lower()
+        if t in ("button","submit","reset","image"): add_el(el)
+    for el in soup.find_all(attrs={"role":"button"}): add_el(el)
+    for el in soup.find_all(attrs={"onclick": True}):
+        xp=build_xpath_like(el)
+        if not any(r["xpath_like"]==xp for r in out): add_el(el)
+    return out
+
+def extract_css(html_path: str, soup) -> Dict[str, Any]:
+    base_dir=os.path.dirname(os.path.abspath(html_path))
+    inline_css_texts=[]; linked_styles=[]
+    for style_tag in soup.find_all("style"):
+        css_text=style_tag.get_text("\n")
+        if css_text.strip(): inline_css_texts.append(css_text)
+    for link in soup.find_all("link", rel=lambda x: x and "stylesheet" in x.lower()):
+        href=link.get("href")
+        if not href: continue
+        resolved=href; is_remote=is_remote_href(href); size=0; content=""
+        if not is_remote:
+            resolved=os.path.normpath(os.path.join(base_dir, href))
+            if os.path.exists(resolved) and os.path.isfile(resolved):
+                try:
+                    content=read_text_safely(resolved); size=os.path.getsize(resolved)
+                except Exception: content=""; size=0
+        linked_styles.append({"href":href,"resolved_path":resolved,"remote":is_remote,"size":size,"loaded":bool(content),"content":content})
+    all_css_text="\n\n/* --- inline styles --- */\n\n" + "\n\n".join(inline_css_texts)
+    for s in linked_styles:
+        if s["loaded"] and s["content"]:
+            all_css_text += f"\n\n/* --- {os.path.basename(s['resolved_path'])} --- */\n\n{s['content']}"
+    return {"inline_css":inline_css_texts,"linked_styles":linked_styles,"all_css_text":all_css_text}
+
+# --------- Macros ---------
+RE_EMAIL = re.compile(r"\{\{RANDOM_EMAIL(?::(\d+))?\}\}")
+def expand_macros(text: str) -> str:
+    def repl(m):
+        n=int(m.group(1) or 12); n=max(1,min(n,64))
+        chars=string.ascii_lowercase+string.digits
+        local="".join(random.choice(chars) for _ in range(n))
+        return f"{local}@gmail.com"
+    return RE_EMAIL.sub(repl, text or "")
+
+# --------------- Automation ---------------
+@dataclass
+class Step:
+    kind: str  # open_url | click_selector | click_xpath | type_text_selector | type_text_xpath | wait | human_captcha
+    value: str = ""
+    note: str = ""
+
+class StepsModel(QtWidgets.QTableWidget):
+    HEADERS=["#","Action","Value","Note","Status"]
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setColumnCount(len(self.HEADERS)); self.setHorizontalHeaderLabels(self.HEADERS)
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows); self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents); self.verticalHeader().setVisible(False)
+    def rows(self)->List[Step]:
+        arr=[]
+        for r in range(self.rowCount()):
+            arr.append(Step(kind=self.item(r,1).text(), value=self.item(r,2).text(), note=self.item(r,3).text() if self.item(r,3) else ""))
+        return arr
+    def set_status(self,row:int,text:str):
+        it=QtWidgets.QTableWidgetItem(text); it.setToolTip(text); self.setItem(row,4,it)
+    def add_step(self,step:Step):
+        row=self.rowCount(); self.insertRow(row)
+        for col,val in enumerate([str(row+1),step.kind,step.value,step.note,""]):
+            it=QtWidgets.QTableWidgetItem(val); it.setToolTip(val); self.setItem(row,col,it)
+    def renumber(self):
+        for r in range(self.rowCount()): self.item(r,0).setText(str(r+1))
+    def move_up(self):
+        r = self.currentRow()
+        if r <= 0:
+            return
+        self._swap(r,r-1)
+    def move_down(self):
+        r=self.currentRow()
+        if r<0 or r>=self.rowCount()-1: return
+        self._swap(r,r+1)
+    def _swap(self,a,b):
+        for c in range(self.columnCount()):
+            ia=self.takeItem(a,c); ib=self.takeItem(b,c)
+            self.setItem(a,c,ib); self.setItem(b,c,ia)
+        self.setCurrentCell(b,0); self.renumber()
+    def delete_selected(self):
+        r=self.currentRow()
+        if r<0: return
+        self.removeRow(r); self.renumber()
+    def clear_all(self):
+        self.setRowCount(0)
+
+class EmbeddedRunner(QtCore.QObject):
+    finished=QtCore.pyqtSignal()
+    progress=QtCore.pyqtSignal(int,str)
+    def __init__(self, webview, table:StepsModel, parent=None):
+        super().__init__(parent); self.web=webview; self.table=table
+        self._steps=[]; self._idx=-1; self._running=False; self._lf_guard=False
+    def run(self):
+        if not self.web:
+            QtWidgets.QMessageBox.warning(None,"Automation","Cần PyQtWebEngine cho Embedded."); return
+        self._steps=self.table.rows()
+        if not self._steps: return
+        self._running=True; self._idx=-1; self._next()
+    def stop(self):
+        self._running=False; self.finished.emit()
+    def _load_with_timeout(self, qurl:QtCore.QUrl, idx:int):
+        self._lf_guard=True
+        def done(ok):
+            if not self._lf_guard: return
+            self._lf_guard=False
+            self.progress.emit(idx, "OK" if ok else "Load failed")
+            QtCore.QTimer.singleShot(200, self._next)
+        # connect once
+        self.web.loadFinished.connect(done)
+        self.web.load(qurl)
+        # fallback timeout
+        QtCore.QTimer.singleShot(12000, lambda: (done(False) if self._lf_guard else None))
+    def _next(self):
+        if not self._running: self.finished.emit(); return
+        self._idx+=1
+        if self._idx>=len(self._steps): self.finished.emit(); return
+        st=self._steps[self._idx]; self.progress.emit(self._idx,"Running...")
+        if st.kind=="open_url":
+            url=st.value.strip()
+            qurl=QtCore.QUrl(url) if (url.startswith("http://") or url.startswith("https://")) else QtCore.QUrl.fromLocalFile(os.path.abspath(url))
+            self._load_with_timeout(qurl, self._idx); return
+        if st.kind=="wait":
+            try: ms=max(0,int(st.value))
+            except: ms=500
+            QtCore.QTimer.singleShot(ms,self._next); return
+        if st.kind=="human_captcha":
+            QtWidgets.QMessageBox.information(None,"Pause for Captcha","Hãy giải captcha trên trang, sau đó bấm OK để tiếp tục."); 
+            QtCore.QTimer.singleShot(10,self._next); return
+        if st.kind in ("click_selector","click_xpath","type_text_selector","type_text_xpath"):
+            if st.kind=="click_selector":
+                selector=st.value.strip()
+                js=f"""
+                (function(){{try{{let el=document.querySelector({json.dumps(selector)}); if(!el) return "not-found";
+                el.scrollIntoView({{behavior:'instant',block:'center'}}); ['mouseover','mousedown','mouseup','click'].forEach(e=>el.dispatchEvent(new MouseEvent(e,{{bubbles:true,cancelable:true,view:window}}))); return "clicked";}}catch(e){{return "error";}}}})();
+                """
+                self.web.page().runJavaScript(js, lambda res:(self.progress.emit(self._idx,"Clicked" if res=="clicked" else ("Selector not found" if res=="not-found" else "JS error")), QtCore.QTimer.singleShot(150,self._next))); return
+            if st.kind=="click_xpath":
+                xp=st.value.strip()
+                js=f"""
+                (function(){{try{{var el=document.evaluate({json.dumps(xp)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(!el) return "not-found";
+                el.scrollIntoView({{behavior:'instant',block:'center'}}); ['mouseover','mousedown','mouseup','click'].forEach(function(e){{el.dispatchEvent(new MouseEvent(e,{{bubbles:true,cancelable:true,view:window}}));}}); return "clicked";}}catch(e){{return "error";}}}})();
+                """
+                self.web.page().runJavaScript(js, lambda res:(self.progress.emit(self._idx,"Clicked" if res=="clicked" else ("XPath not found" if res=="not-found" else "JS error")), QtCore.QTimer.singleShot(150,self._next))); return
+            raw=st.value; parts=raw.split("||",1)
+            if len(parts)!=2: self.progress.emit(self._idx,"Bad value"); QtCore.QTimer.singleShot(100,self._next); return
+            sel=parts[0].strip(); text=expand_macros(parts[1].strip())
+            if st.kind=="type_text_selector":
+                js=f"""
+                (function(){{try{{var el=document.querySelector({json.dumps(sel)}); if(!el) return "not-found";
+                el.focus(); var val={json.dumps(text)}; try{{Object.getOwnPropertyDescriptor(el.__proto__,'value').set.call(el,val);}}catch(e){{el.value=val;}} el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return "typed";}}catch(e){{return "error";}}}})();
+                """
+            else:
+                js=f"""
+                (function(){{try{{var el=document.evaluate({json.dumps(sel)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(!el) return "not-found";
+                el.focus(); var val={json.dumps(text)}; try{{Object.getOwnPropertyDescriptor(el.__proto__,'value').set.call(el,val);}}catch(e){{el.value=val;}} el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return "typed";}}catch(e){{return "error";}}}})();
+                """
+            self.web.page().runJavaScript(js, lambda res:(self.progress.emit(self._idx,"Typed" if res=="typed" else ("Target not found" if res=="not-found" else "JS error")), QtCore.QTimer.singleShot(120,self._next))); return
+        self.progress.emit(self._idx, f"Unknown step: {st.kind}"); QtCore.QTimer.singleShot(80,self._next)
+
+class ChromeRunner(QtCore.QObject):
+    finished=QtCore.pyqtSignal()
+    progress=QtCore.pyqtSignal(int,str)
+    def __init__(self, table:StepsModel, get_proxy_callable, get_clear_flag_callable, parent=None):
+        super().__init__(parent); self.table=table; self._driver=None; self._steps=[]; self._idx=-1; self._running=False
+        self._get_proxy = get_proxy_callable
+        self._get_clear_flag = get_clear_flag_callable
+    def _build_options(self, proxy_url:str, fallback=False):
+        webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager = _import_selenium()
+        opts=ChromeOptions()
+        opts.add_argument(f"--user-data-dir={PROFILE_DIR}"); opts.add_argument("--profile-directory=Default")
+        opts.add_argument(f"--disk-cache-dir={CACHE_DIR}"); opts.add_argument("--no-first-run"); opts.add_argument("--no-default-browser-check")
+        opts.add_argument("--disable-extensions"); opts.add_argument("--disable-background-networking"); opts.add_argument("--disable-sync")
+        opts.add_argument("--disable-dev-shm-usage"); opts.add_argument("--remote-allow-origins=*"); opts.add_argument("--disable-gpu"); opts.add_argument("--disable-software-rasterizer"); opts.add_argument("--no-sandbox")
+        if proxy_url: opts.add_argument(f"--proxy-server={proxy_url}")
+        if fallback: opts.add_argument("--disable-features=VizDisplayCompositor,OptimizationHints,NetworkServiceInProcess")
+        return webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager, opts
+    def _ensure_driver_async(self, on_ready):
+        proxy_url = self._get_proxy() or ""
+        def worker():
+            # Clear profile if requested
+            try:
+                if self._get_clear_flag():
+                    _clear_dir_safe(PROFILE_DIR)
+                    os.makedirs(PROFILE_DIR, exist_ok=True)
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+            except Exception:
+                pass
+            webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager, opts = self._build_options(proxy_url, fallback=False)
+            try:
+                drv = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts)
+            except Exception:
+                webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager, opts2 = self._build_options(proxy_url, fallback=True)
+                drv = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts2)
+            try:
+                drv.set_page_load_timeout(25)
+            except Exception:
+                pass
+            on_ready(drv)
+        threading.Thread(target=worker, daemon=True).start()
+    def run(self):
+        self._steps=self.table.rows()
+        if not self._steps: return
+        self._running=True; self._idx=-1
+        def ready(drv):
+            self._driver=drv
+            QtCore.QTimer.singleShot(0, self._next)
+        self._ensure_driver_async(on_ready=ready)
+    def stop(self):
+        self._running=False
+        try:
+            if self._driver: self._driver.quit()
+        except Exception:
+            pass
+        self.finished.emit()
+    def _next(self):
+        if not self._running: self.stop(); return
+        self._idx+=1
+        if self._idx>=len(self._steps): self.stop(); return
+        st=self._steps[self._idx]; self.progress.emit(self._idx,"Running...")
+        try:
+            webdriver, ChromeService, ChromeOptions, TimeoutException, ChromeDriverManager = _import_selenium()
+            if st.kind=="open_url":
+                url=st.value.strip()
+                if not (url.startswith("http://") or url.startswith("https://") or url.startswith("file://")):
+                    url="file://"+os.path.abspath(url).replace("\\","/").replace(" ","%20")
+                try:
+                    self._driver.get(url)
+                    self.progress.emit(self._idx,"OK")
+                except TimeoutException:
+                    self.progress.emit(self._idx,"Load timeout (continue)")
+                QtCore.QTimer.singleShot(250,self._next); return
+            if st.kind in ("click_selector","click_xpath"):
+                if st.kind=="click_selector":
+                    selector=st.value.strip()
+                    js=f"""
+                    var el=document.querySelector({json.dumps(selector)}); if(!el) return "not-found";
+                    el.scrollIntoView({{behavior:"instant",block:"center"}});
+                    ["mouseover","mousedown","mouseup","click"].forEach(function(e){{el.dispatchEvent(new MouseEvent(e,{{bubbles:true,cancelable:true,view:window}}));}});
+                    return "clicked";
+                    """
+                else:
+                    xp=st.value.strip()
+                    js=f"""
+                    var el=document.evaluate({json.dumps(xp)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(!el) return "not-found";
+                    el.scrollIntoView({{behavior:"instant",block:"center"}});
+                    ["mouseover","mousedown","mouseup","click"].forEach(function(e){{el.dispatchEvent(new MouseEvent(e,{{bubbles:true,cancelable:true,view:window}}));}});
+                    return "clicked";
+                    """
+                res=self._driver.execute_script(js)
+                self.progress.emit(self._idx, "Clicked" if res=="clicked" else ("Selector/XPath not found" if res=="not-found" else "JS error"))
+                QtCore.QTimer.singleShot(150,self._next); return
+            if st.kind in ("type_text_selector","type_text_xpath"):
+                raw=st.value; parts=raw.split("||",1)
+                if len(parts)!=2: self.progress.emit(self._idx,"Bad value"); QtCore.QTimer.singleShot(150,self._next); return
+                sel=parts[0].strip(); text=expand_macros(parts[1].strip())
+                if st.kind=="type_text_selector":
+                    js=f"""
+                    var el=document.querySelector({json.dumps(sel)}); if(!el) return "not-found"; el.focus();
+                    var val={json.dumps(text)}; try{{Object.getOwnPropertyDescriptor(el.__proto__,'value').set.call(el,val);}}catch(e){{el.value=val;}}
+                    el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return "typed";
+                    """
+                else:
+                    js=f"""
+                    var el=document.evaluate({json.dumps(sel)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue; if(!el) return "not-found"; el.focus();
+                    var val={json.dumps(text)}; try{{Object.getOwnPropertyDescriptor(el.__proto__,'value').set.call(el,val);}}catch(e){{el.value=val;}}
+                    el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return "typed";
+                    """
+                res=self._driver.execute_script(js)
+                self.progress.emit(self._idx, "Typed" if res=="typed" else ("Target not found" if res=="not-found" else "JS error"))
+                QtCore.QTimer.singleShot(120,self._next); return
+            if st.kind=="wait":
+                try: ms=max(0,int(st.value))
+                except: ms=500
+                QtCore.QTimer.singleShot(ms,self._next); return
+            if st.kind=="human_captcha":
+                QtWidgets.QMessageBox.information(None,"Pause for Captcha","Hãy giải captcha trên trang, sau đó bấm OK để tiếp tục.")
+                QtCore.QTimer.singleShot(10,self._next); return
+            self.progress.emit(self._idx,f"Unknown step: {st.kind}"); QtCore.QTimer.singleShot(80,self._next)
+        except Exception as e:
+            self.progress.emit(self._idx,f"Error: {e}")
+            QtCore.QTimer.singleShot(150,self._next)
+
+# -------- UI Tables --------
+class ButtonsTable(QtWidgets.QTableWidget):
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        headers=["#","Tag","Text","id","class","type","name","role","onclick","selector","xpath_like"]
+        self.setColumnCount(len(headers)); self.setHorizontalHeaderLabels(headers)
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows); self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents); self.setAlternatingRowColors(True)
+        self.verticalHeader().setVisible(False)
+    def load(self, rows: List[Dict[str,Any]]):
+        self.setRowCount(0)
+        for i, r in enumerate(rows, start=1):
+            self.append_row(r, i)
+    def append_row(self, r: Dict[str,Any], index: Optional[int]=None):
+        row_idx=self.rowCount(); self.insertRow(row_idx); i=index if index is not None else row_idx+1
+        vals=[str(i), r.get("tag",""), r.get("text",""), r.get("id",""), r.get("classes",""), r.get("type",""), r.get("name",""), r.get("role",""), r.get("onclick",""), r.get("selector",""), r.get("xpath_like","")]
+        for col, v in enumerate(vals):
+            it=QtWidgets.QTableWidgetItem(v); it.setToolTip(v); self.setItem(row_idx,col,it)
+    def renumber(self):
+        for r in range(self.rowCount()): self.item(r,0).setText(str(r+1))
+
+# -------- Main Window --------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("HTML Button & CSS Inspector — v3.7"); self.resize(1360, 900)
+        self._pick_timer: Optional[QtCore.QTimer] = None
+
+        # Toolbar
+        open_btn=QtWidgets.QAction("Open HTML…", self); open_btn.triggered.connect(self.open_html)
+        import_btn_json=QtWidgets.QAction("Import Buttons JSON…", self); import_btn_json.triggered.connect(self.import_buttons_json)
+        export_json_btn=QtWidgets.QAction("Export Buttons JSON…", self); export_json_btn.triggered.connect(self.export_buttons_json)
+        save_css_btn=QtWidgets.QAction("Save CSS As…", self); save_css_btn.triggered.connect(self.save_css_as)
+        copy_selector_btn=QtWidgets.QAction("Copy Selector", self); copy_selector_btn.triggered.connect(self.copy_selected_selector)
+        copy_xpath_btn=QtWidgets.QAction("Copy XPath", self); copy_xpath_btn.triggered.connect(self.copy_selected_xpath)
+        self.act_pick=QtWidgets.QAction("Pick on Preview", self); self.act_pick.setCheckable(True); self.act_pick.toggled.connect(self.toggle_picker)
+        self.act_clear_profile=QtWidgets.QAction("Clear Chrome Data Now", self); self.act_clear_profile.triggered.connect(self.clear_chrome_now)
+
+        tb=self.addToolBar("Main")
+        tb.addAction(open_btn); tb.addAction(import_btn_json); tb.addSeparator()
+        tb.addAction(export_json_btn); tb.addAction(save_css_btn); tb.addSeparator()
+        tb.addAction(copy_selector_btn); tb.addAction(copy_xpath_btn); tb.addSeparator()
+        tb.addAction(self.act_pick); tb.addAction(self.act_clear_profile)
+
+        # Central splitter
+        splitter=QtWidgets.QSplitter(self); splitter.setOrientation(QtCore.Qt.Horizontal); self.setCentralWidget(splitter)
+
+        # Left tabs
+        left_tabs=QtWidgets.QTabWidget(); splitter.addWidget(left_tabs); splitter.setStretchFactor(0,2)
+
+        # Buttons tab
+        btn_tab=QtWidgets.QWidget(); btn_layout=QtWidgets.QVBoxLayout(btn_tab)
+        self.table=ButtonsTable(); btn_layout.addWidget(self.table,1)
+        self.lbl_tip=QtWidgets.QLabel("Tip: Bật 'Pick on Preview' rồi click trong preview để thêm phần tử."); self.lbl_tip.setStyleSheet("color:#666;")
+        btn_layout.addWidget(self.lbl_tip)
+        quick=QtWidgets.QHBoxLayout()
+        self.btn_add_click=QtWidgets.QPushButton("Automation: Add Click (from selected)"); self.btn_add_click.clicked.connect(self.add_click_from_selected)
+        self.btn_add_click_xpath=QtWidgets.QPushButton("Automation: Add Click XPath (from selected)"); self.btn_add_click_xpath.clicked.connect(self.add_click_xpath_from_selected)
+        quick.addWidget(self.btn_add_click); quick.addWidget(self.btn_add_click_xpath); btn_layout.addLayout(quick)
+        left_tabs.addTab(btn_tab,"Buttons")
+
+        # CSS tab
+        self.css_edit=QtWidgets.QPlainTextEdit(); self.css_edit.setReadOnly(True); self.css_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        left_tabs.addTab(self.css_edit,"CSS")
+
+        # Stylesheets tab
+        self.styles_table=QtWidgets.QTableWidget(); self.styles_table.setColumnCount(4)
+        self.styles_table.setHorizontalHeaderLabels(["href","resolved_path","remote","size(bytes)"])
+        self.styles_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        self.styles_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows); self.styles_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.styles_table.verticalHeader().setVisible(False)
+        left_tabs.addTab(self.styles_table,"Stylesheets")
+
+        # Right tabs
+        right_tabs=QtWidgets.QTabWidget(); splitter.addWidget(right_tabs); splitter.setStretchFactor(1,3)
+
+        # Preview tab
+        preview=QtWidgets.QWidget(); pv=QtWidgets.QVBoxLayout(preview)
+        if _HAS_WEB:
+            self.web=QtWebEngineWidgets.QWebEngineView(); pv.addWidget(self.web,1)
+        else:
+            lbl=QtWidgets.QLabel("PyQtWebEngine không khả dụng — chỉ dùng được Chrome (Selenium)."); lbl.setAlignment(QtCore.Qt.AlignCenter); lbl.setStyleSheet("color:#777;"); self.web=None; pv.addWidget(lbl,1)
+        self.html_view=QtWidgets.QPlainTextEdit(); self.html_view.setReadOnly(True); self.html_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap); self.html_view.setPlaceholderText("Raw selector / XPath…"); pv.addWidget(self.html_view,1)
+        right_tabs.addTab(preview,"Preview")
+
+        # Automation tab
+        autom=QtWidgets.QWidget(); a=QtWidgets.QVBoxLayout(autom)
+
+        top_row=QtWidgets.QHBoxLayout()
+        self.btn_open_url=QtWidgets.QPushButton("Add: Open URL…"); self.btn_open_url.clicked.connect(self.add_open_url)
+        self.btn_wait=QtWidgets.QPushButton("Add: Wait (ms)…"); self.btn_wait.clicked.connect(self.add_wait)
+        self.btn_type_css=QtWidgets.QPushButton("Add: Type (CSS selector)…"); self.btn_type_css.clicked.connect(self.add_type_css)
+        self.btn_type_xpath=QtWidgets.QPushButton("Add: Type (XPath)…"); self.btn_type_xpath.clicked.connect(self.add_type_xpath)
+        self.btn_pause_captcha=QtWidgets.QPushButton("Add: Pause for Captcha"); self.btn_pause_captcha.clicked.connect(self.add_pause_captcha)
+        top_row.addWidget(self.btn_open_url); top_row.addWidget(self.btn_wait); top_row.addWidget(self.btn_type_css); top_row.addWidget(self.btn_type_xpath); top_row.addWidget(self.btn_pause_captcha)
+        top_row.addStretch(1)
+        top_row.addWidget(QtWidgets.QLabel("Engine:"))
+        self.engine_combo=QtWidgets.QComboBox(); self.engine_combo.addItems(["Embedded Preview (QtWebEngine)", "Chrome (Selenium)"]); top_row.addWidget(self.engine_combo)
+        top_row.addWidget(QtWidgets.QLabel("Proxy:")); self.proxy_edit=QtWidgets.QLineEdit(); self.proxy_edit.setPlaceholderText("http://127.0.0.1:8080 hoặc socks5://host:port"); self.proxy_edit.setMinimumWidth(240); top_row.addWidget(self.proxy_edit)
+        self.chk_clear_on_run = QtWidgets.QCheckBox("Xóa dữ liệu Chrome khi chạy"); top_row.addWidget(self.chk_clear_on_run)
+        a.addLayout(top_row)
+
+        self.steps=StepsModel(); a.addWidget(self.steps,1)
+
+        bottom=QtWidgets.QHBoxLayout()
+        self.btn_up=QtWidgets.QPushButton("Up"); self.btn_down=QtWidgets.QPushButton("Down")
+        self.btn_del=QtWidgets.QPushButton("Delete"); self.btn_clear=QtWidgets.QPushButton("Clear")
+        self.btn_run=QtWidgets.QPushButton("Run"); self.btn_stop=QtWidgets.QPushButton("Stop")
+        self.btn_save=QtWidgets.QPushButton("Save Steps…"); self.btn_load=QtWidgets.QPushButton("Load Steps…")
+        self.btn_up.clicked.connect(self.steps.move_up); self.btn_down.clicked.connect(self.steps.move_down)
+        self.btn_del.clicked.connect(self.steps.delete_selected); self.btn_clear.clicked.connect(self.steps.clear_all)
+        self.btn_run.clicked.connect(self.run_steps); self.btn_stop.clicked.connect(self.stop_steps)
+        self.btn_save.clicked.connect(self.save_steps); self.btn_load.clicked.connect(self.load_steps)
+        for w in [self.btn_up,self.btn_down,self.btn_del,self.btn_clear,self.btn_run,self.btn_stop,self.btn_save,self.btn_load]: bottom.addWidget(w)
+        bottom.addStretch(1); a.addLayout(bottom)
+
+        right_tabs.addTab(autom,"Automation")
+
+        # runners
+        self.embed_runner=EmbeddedRunner(self.web, self.steps, self)
+        self.embed_runner.progress.connect(self.on_progress); self.embed_runner.finished.connect(lambda: self.statusBar().showMessage("Embedded automation finished"))
+        self.chrome_runner=ChromeRunner(self.steps, self.get_proxy, self.get_clear_flag, self)
+        self.chrome_runner.progress.connect(self.on_progress); self.chrome_runner.finished.connect(lambda: self.statusBar().showMessage("Chrome automation finished"))
+
+        # signals
+        self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
+        self.table.itemDoubleClicked.connect(self.on_table_double_clicked)
+
+        self._state_timer=QtCore.QTimer(self); self._state_timer.setInterval(2000); self._state_timer.timeout.connect(self.save_state); self._state_timer.start()
+
+        self.statusBar().showMessage("Ready")
+
+        # Restore state
+        self.load_state()
+
+    # ---------- Proxy getter ----------
+    def get_proxy(self) -> str:
+        return self.proxy_edit.text().strip()
+
+
+    # ---------- Chrome profile clear ----------
+    def get_clear_flag(self) -> bool:
+        try:
+            return bool(self.chk_clear_on_run.isChecked())
+        except Exception:
+            return False
+
+    def clear_chrome_now(self):
+        try:
+            _clear_dir_safe(PROFILE_DIR)
+            os.makedirs(PROFILE_DIR, exist_ok=True)
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            QtWidgets.QMessageBox.information(self, "Clear Chrome", "Đã xoá dữ liệu Chrome profile.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Clear Chrome", f"Không thể xoá: {e}")
+
+    # ---------- Picker ----------
+    def toggle_picker(self, on: bool):
+        if not self.web:
+            QtWidgets.QMessageBox.information(self,"Picker","Picker chỉ hoạt động ở chế độ Embedded."); self.act_pick.setChecked(False); return
+        if on:
+            js = """
+            (function(){
+              try{
+                if (window.__hbiPickerActive) return true;
+                window.__hbiPicked = null;
+                window.__hbiPickerActive = true;
+                function cssSel(el){ if (el.id) return '#'+el.id; var sel=el.tagName.toLowerCase(); if(el.classList&&el.classList.length) sel+='.'+Array.from(el.classList).join('.'); return sel; }
+                function xpLike(el){ var parts=[],node=el; while(node&&node.nodeType===1&&node!==document){ var tag=node.tagName.toLowerCase(); var idx=1,sib=node.previousElementSibling; while(sib){ if(sib.tagName.toLowerCase()===tag) idx++; sib=sib.previousElementSibling; } parts.push(tag+'['+idx+']'); node=node.parentElement; } parts.push('html'); return '/' + parts.reverse().join('/'); }
+                function textOf(el){ var t=(el.innerText||el.textContent||'').trim(); return t.length>200?t.slice(0,200):t; }
+                var overlay=document.createElement('div'); overlay.style.cssText='position:fixed;z-index:2147483647;border:2px solid #ff00ff;background:rgba(255,0,255,0.08);pointer-events:none;top:0;left:0;width:0;height:0;'; document.documentElement.appendChild(overlay);
+                function rectFor(el){ var r=el.getBoundingClientRect(); overlay.style.left=r.left+'px'; overlay.style.top=r.top+'px'; overlay.style.width=r.width+'px'; overlay.style.height=r.height+'px'; }
+                function onMove(e){ var el=e.target; if(!el||el===document.documentElement||el===document.body) return; rectFor(el); }
+                function onClick(e){ e.preventDefault(); e.stopPropagation(); var el=e.target; window.__hbiPicked={ tag:el.tagName.toLowerCase(), text:textOf(el), id:el.id||'', classes:el.className||'', type:el.type||'', name:el.name||'', role:el.getAttribute('role')||'', onclick:el.getAttribute('onclick')||'', selector:cssSel(el), xpath_like:xpLike(el) }; }
+                document.addEventListener('mousemove', onMove, true); document.addEventListener('click', onClick, true);
+                window.__hbiPickerStop=function(){ try{ document.removeEventListener('mousemove', onMove, true); document.removeEventListener('click', onClick, true); overlay && overlay.remove(); window.__hbiPickerActive=false; }catch(e){} };
+                return true;
+              }catch(e){ return false; }
+            })();
+            """
+            self.web.page().runJavaScript(js)
+            if self._pick_timer: self._pick_timer.stop()
+            self._pick_timer=QtCore.QTimer(self); self._pick_timer.setInterval(150); self._pick_timer.timeout.connect(self._poll_pick); self._pick_timer.start()
+            self.statusBar().showMessage("Picker ON — click trong preview để thu thập phần tử.")
+        else:
+            js="try{window.__hbiPickerStop && window.__hbiPickerStop();}catch(e){}; true;"
+            self.web.page().runJavaScript(js)
+            if self._pick_timer: self._pick_timer.stop(); self._pick_timer=None
+            self.statusBar().showMessage("Picker OFF")
+    def _poll_pick(self):
+        js="try{var x=window.__hbiPicked; if(x){ window.__hbiPicked=null; JSON.stringify(x);} else '';}catch(e){''}"
+        def cb(res):
+            if not res: return
+            try:
+                data=json.loads(res); self.table.append_row(data); self.table.renumber()
+                self.html_view.setPlainText((data.get('selector','') or '') + ('\\n'+data.get('xpath_like','') if data.get('xpath_like') else ''))
+                self.statusBar().showMessage(f"Đã thêm phần tử: {data.get('selector','')}")
+            except Exception: pass
+        self.web.page().runJavaScript(js, cb)
+
+    # ---------- File ops ----------
+    def open_html(self):
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Chọn file HTML","", "HTML Files (*.html *.htm);;All Files (*.*)")
+        if not path: return
+        self.load_html(path)
+    def import_buttons_json(self):
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Import Buttons JSON","","JSON Files (*.json)")
+        if not path: return
+        try:
+            with open(path,"r",encoding="utf-8") as f: data=json.load(f)
+            if not isinstance(data,list): raise ValueError("JSON phải là mảng objects")
+            self.table.load(data); self.statusBar().showMessage(f"Imported buttons: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"Import Buttons",f"Không thể import: {e}")
+    def load_html(self, path:str):
+        html=read_text_safely(path); soup=BeautifulSoup(html,"lxml")
+        buttons=collect_buttons(soup); self.table.load(buttons)
+        css_info=extract_css(path,soup); self.css_edit.setPlainText(css_info.get("all_css_text",""))
+        linked=css_info.get("linked_styles",[]); self.styles_table.setRowCount(0)
+        for item in linked:
+            r=self.styles_table.rowCount(); self.styles_table.insertRow(r)
+            for c,k in enumerate(["href","resolved_path","remote","size"]):
+                it=QtWidgets.QTableWidgetItem(str(item.get(k,""))); it.setToolTip(str(item.get(k,""))); self.styles_table.setItem(r,c,it)
+        if _HAS_WEB: self.web.load(QtCore.QUrl.fromLocalFile(os.path.abspath(path)))
+        self.statusBar().showMessage(f"Loaded: {os.path.basename(path)} — {len(buttons)} buttons")
+
+    # ---------- Buttons helpers ----------
+    def on_table_selection_changed(self):
+        row=self.table.currentRow()
+        if row<0: self.html_view.clear(); return
+        selector=self.table.item(row,9).text() if self.table.item(row,9) else ""
+        xp=self.table.item(row,10).text() if self.table.item(row,10) else ""
+        self.html_view.setPlainText((selector or "") + ("\\n"+xp if xp else ""))
+    def on_table_double_clicked(self, item):
+        if not _HAS_WEB: return
+        row=self.table.currentRow()
+        if row<0: return
+        selector=self.table.item(row,9).text()
+        js=f"""(function(){{try{{var el=document.querySelector({json.dumps(selector)}); if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}}); el.style.outline='3px solid magenta'; setTimeout(()=>{{el.style.outline='';}},1500); return true;}} else return false;}}catch(e){{return false;}}}})();"""
+        self.web.page().runJavaScript(js)
+    def export_buttons_json(self):
+        rows=[]
+        for r in range(self.table.rowCount()):
+            rows.append({
+                "tag": self.table.item(r,1).text(), "text": self.table.item(r,2).text(),
+                "id": self.table.item(r,3).text(), "classes": self.table.item(r,4).text(),
+                "type": self.table.item(r,5).text(), "name": self.table.item(r,6).text(),
+                "role": self.table.item(r,7).text(), "onclick": self.table.item(r,8).text(),
+                "selector": self.table.item(r,9).text(), "xpath_like": self.table.item(r,10).text(),
+            })
+        if not rows: QtWidgets.QMessageBox.information(self,"Export","Chưa có dữ liệu nút để xuất."); return
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Lưu buttons.json","buttons.json","JSON Files (*.json)")
+        if not path: return
+        with open(path,"w",encoding="utf-8") as f: json.dump(rows,f,ensure_ascii=False,indent=2)
+        self.statusBar().showMessage(f"Đã xuất: {path}")
+    def save_css_as(self):
+        css=self.css_edit.toPlainText()
+        if not css.strip(): QtWidgets.QMessageBox.information(self,"Save CSS","Không có CSS để lưu."); return
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Lưu all.css","all.css","CSS Files (*.css);;All Files (*.*)")
+        if not path: return
+        with open(path,"w",encoding="utf-8") as f: f.write(css)
+        self.statusBar().showMessage(f"Đã lưu CSS: {path}")
+    def copy_selected_selector(self):
+        row=self.table.currentRow()
+        if row<0: return
+        selector=self.table.item(row,9).text(); QtWidgets.QApplication.clipboard().setText(selector); self.statusBar().showMessage(f"Đã copy selector: {selector}")
+    def copy_selected_xpath(self):
+        row=self.table.currentRow()
+        if row<0: return
+        xp=self.table.item(row,10).text(); QtWidgets.QApplication.clipboard().setText(xp); self.statusBar().showMessage(f"Đã copy XPath: {xp}")
+
+    # ---------- Automation UI actions ----------
+    def add_click_from_selected(self):
+        row=self.table.currentRow()
+        if row<0: QtWidgets.QMessageBox.information(self,"Automation","Chọn một nút ở tab Buttons trước."); return
+        selector=self.table.item(row,9).text(); text=self.table.item(row,2).text(); self.steps.add_step(Step(kind="click_selector", value=selector, note=f"Click '{text}' (CSS)"))
+    def add_click_xpath_from_selected(self):
+        row=self.table.currentRow()
+        if row<0: QtWidgets.QMessageBox.information(self,"Automation","Chọn một nút ở tab Buttons trước."); return
+        xp=self.table.item(row,10).text(); text=self.table.item(row,2).text(); self.steps.add_step(Step(kind="click_xpath", value=xp, note=f"Click '{text}' (XPath)"))
+    def add_open_url(self):
+        url,ok=QtWidgets.QInputDialog.getText(self,"Open URL","Nhập URL (http/https/file://) hoặc đường dẫn file:")
+        if not ok or not url.strip(): return
+        self.steps.add_step(Step(kind="open_url", value=url.strip(), note=""))
+    def add_wait(self):
+        ms,ok=QtWidgets.QInputDialog.getInt(self,"Wait","Milliseconds:",800,0,600000,50)
+        if not ok: return
+        self.steps.add_step(Step(kind="wait", value=str(ms), note=""))
+    def add_type_css(self):
+        selector,ok=QtWidgets.QInputDialog.getText(self,"Type (CSS selector)","CSS selector của ô input (ví dụ #email):")
+        if not ok or not selector.strip(): return
+        text,ok2=QtWidgets.QInputDialog.getText(self,"Type value","Giá trị cần nhập (hỗ trợ {{RANDOM_EMAIL:12}}):", text="{{RANDOM_EMAIL:12}}")
+        if not ok2: return
+        self.steps.add_step(Step(kind="type_text_selector", value=f"{selector.strip()} || {text}", note="Type CSS"))
+    def add_type_xpath(self):
+        xp,ok=QtWidgets.QInputDialog.getText(self,"Type (XPath)","XPath của ô input:")
+        if not ok or not xp.strip(): return
+        text,ok2=QtWidgets.QInputDialog.getText(self,"Type value","Giá trị cần nhập (hỗ trợ {{RANDOM_EMAIL:12}}):", text="{{RANDOM_EMAIL:12}}")
+        if not ok2: return
+        self.steps.add_step(Step(kind="type_text_xpath", value=f"{xp.strip()} || {text}", note="Type XPath"))
+    def add_pause_captcha(self):
+        self.steps.add_step(Step(kind="human_captcha", value="", note="Pause for Captcha"))
+
+    def run_steps(self):
+        for r in range(self.steps.rowCount()): self.steps.set_status(r,"")
+        engine=self.engine_combo.currentText()
+        if engine.startswith("Embedded"):
+            self.statusBar().showMessage("Running (Embedded)…"); self.embed_runner.run()
+        else:
+            self.statusBar().showMessage("Running (Chrome)…"); self.chrome_runner.run()
+
+    def stop_steps(self):
+        engine=self.engine_combo.currentText()
+        if engine.startswith("Embedded"): self.embed_runner.stop()
+        else: self.chrome_runner.stop()
+        self.statusBar().showMessage("Stopped")
+
+    def on_progress(self, row:int, status:str):
+        self.steps.set_status(row,status)
+
+    # ---------- Save/Load Steps ----------
+    def save_steps(self):
+        steps=[asdict(s) for s in self.steps.rows()]
+        if not steps: QtWidgets.QMessageBox.information(self,"Save Steps","Chưa có bước nào để lưu."); return
+        path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Save Steps","steps.json","JSON Files (*.json)")
+        if not path: return
+        with open(path,"w",encoding="utf-8") as f: json.dump(steps,f,ensure_ascii=False,indent=2)
+        self.statusBar().showMessage(f"Saved: {path}")
+    def load_steps(self):
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Load Steps","","JSON Files (*.json)")
+        if not path: return
+        try:
+            with open(path,"r",encoding="utf-8") as f: data=json.load(f)
+            self.steps.clear_all()
+            for item in data: self.steps.add_step(Step(kind=item.get("kind",""), value=item.get("value",""), note=item.get("note","")))
+            self.steps.renumber(); self.statusBar().showMessage(f"Loaded steps: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"Load Steps",f"Không thể đọc file: {e}")
+
+    # ---------- Persist UI state ----------
+    def save_state(self):
+        try:
+            steps=[asdict(s) for s in self.steps.rows()]
+            state={
+                "geometry": bytes(self.saveGeometry()).hex(),
+                "engine_index": self.engine_combo.currentIndex(),
+                "proxy": self.proxy_edit.text(),
+                "clear_on_run": bool(self.chk_clear_on_run.isChecked()),
+                "buttons": [],  # (optional) để nhẹ, không lưu bảng nút quét vì có thể lớn
+                "steps": steps
+            }
+            with open(STATE_PATH,"w",encoding="utf-8") as f: json.dump(state,f,ensure_ascii=False,indent=2)
+        except Exception:
+            pass
+    
+    def load_state(self):
+        if not os.path.exists(STATE_PATH):
+            return
+        # Read state file
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            return
+
+        # Restore geometry
+        geo_hex = state.get("geometry")
+        if geo_hex:
+            try:
+                self.restoreGeometry(bytes.fromhex(geo_hex))
+            except Exception:
+                pass
+
+        # Restore controls
+        try:
+            self.engine_combo.setCurrentIndex(int(state.get("engine_index", 0)))
+        except Exception:
+            pass
+        try:
+            self.proxy_edit.setText(state.get("proxy", ""))
+        except Exception:
+            pass
+        try:
+            self.chk_clear_on_run.setChecked(bool(state.get("clear_on_run", False)))
+        except Exception:
+            pass
+
+        # Restore steps
+        try:
+            self.steps.clear_all()
+            for item in state.get("steps", []):
+                self.steps.add_step(Step(kind=item.get("kind", ""), value=item.get("value", ""), note=item.get("note", "")))
+            self.steps.renumber()
+        except Exception:
+            pass
+
+    # ---------- Close ----------
+    def closeEvent(self, e):
+        self.save_state()
+        super().closeEvent(e)
+def closeEvent(self, e):
+        self.save_state()
+        super().closeEvent(e)
+
+def main():
+    app=QtWidgets.QApplication(sys.argv)
+    win=MainWindow(); win.show()
+    sys.exit(app.exec_())
+
+if __name__=="__main__":
+    main()
